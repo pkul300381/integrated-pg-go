@@ -12,7 +12,8 @@ import (
 // Message represents a minimal ISO8583 message used here.
 // MTI: 4 ASCII bytes
 // Bitmap: 8 bytes primary (and optional secondary)
-// Supported fields in this skeleton: 7 (MMDDhhmmss), 11 (STAN, 6n), 70 (3n)
+// Supported fields in this skeleton: 7 (MMDDhhmmss), 11 (STAN, 6n), 48 (LLLVAR),
+// 70 (3n) and 102 (LLVAR)
 type Message struct {
 	MTI    string
 	Fields map[int]string // field number -> ASCII string
@@ -29,8 +30,66 @@ func (m *Message) Set(field int, value string) { m.Fields[field] = value }
 // Get gets a field value (ASCII string) and presence bool.
 func (m *Message) Get(field int) (string, bool) { v, ok := m.Fields[field]; return v, ok }
 
+// packLLVAR writes a value prefixed with a 2-digit ASCII length.
+func packLLVAR(buf *bytes.Buffer, v string) error {
+	if len(v) > 99 {
+		return fmt.Errorf("value too long for LLVAR: %d", len(v))
+	}
+	buf.WriteString(fmt.Sprintf("%02d", len(v)))
+	buf.WriteString(v)
+	return nil
+}
+
+// packLLLVAR writes a value prefixed with a 3-digit ASCII length.
+func packLLLVAR(buf *bytes.Buffer, v string) error {
+	if len(v) > 999 {
+		return fmt.Errorf("value too long for LLLVAR: %d", len(v))
+	}
+	buf.WriteString(fmt.Sprintf("%03d", len(v)))
+	buf.WriteString(v)
+	return nil
+}
+
+// unpackLLVAR reads a LLVAR value starting at *off in b.
+// It returns the string and advances *off.
+func unpackLLVAR(b []byte, off *int) (string, error) {
+	if *off+2 > len(b) {
+		return "", errors.New("truncated LLVAR length")
+	}
+	l, err := strconv.Atoi(string(b[*off : *off+2]))
+	if err != nil {
+		return "", fmt.Errorf("invalid LLVAR length: %w", err)
+	}
+	*off += 2
+	if *off+l > len(b) {
+		return "", errors.New("truncated LLVAR value")
+	}
+	v := string(b[*off : *off+l])
+	*off += l
+	return v, nil
+}
+
+// unpackLLLVAR reads a LLLVAR value starting at *off in b and advances *off.
+func unpackLLLVAR(b []byte, off *int) (string, error) {
+	if *off+3 > len(b) {
+		return "", errors.New("truncated LLLVAR length")
+	}
+	l, err := strconv.Atoi(string(b[*off : *off+3]))
+	if err != nil {
+		return "", fmt.Errorf("invalid LLLVAR length: %w", err)
+	}
+	*off += 3
+	if *off+l > len(b) {
+		return "", errors.New("truncated LLLVAR value")
+	}
+	v := string(b[*off : *off+l])
+	*off += l
+	return v, nil
+}
+
 // Pack builds a wire message: [2B MLI][4B MTI ASCII][8B bitmap][fields...]
-// For our three fields, encoding is ASCII numeric, fixed-length except DE7 (10) and DE70 (3).
+// Numeric fields are encoded as ASCII. Variable-length fields use ASCII length
+// headers (LLVAR/LLLVAR) where appropriate.
 func (m *Message) Pack() ([]byte, error) {
 	if len(m.MTI) != 4 {
 		return nil, fmt.Errorf("invalid MTI: %q", m.MTI)
@@ -82,11 +141,19 @@ func (m *Message) Pack() ([]byte, error) {
 				return nil, fmt.Errorf("DE11 must be 6 digits, got %d", len(v))
 			}
 			body.WriteString(v)
+		case 48: // Additional Data (LLLVAR)
+			if err := packLLLVAR(body, v); err != nil {
+				return nil, fmt.Errorf("DE48: %w", err)
+			}
 		case 70: // Network Mgmt Code (3n)
 			if len(v) != 3 {
 				return nil, fmt.Errorf("DE70 must be 3 digits, got %d", len(v))
 			}
 			body.WriteString(v)
+		case 102: // Account Identification 1 (LLVAR)
+			if err := packLLVAR(body, v); err != nil {
+				return nil, fmt.Errorf("DE102: %w", err)
+			}
 		default:
 			return nil, fmt.Errorf("field %d not implemented in skeleton", f)
 		}
@@ -149,12 +216,24 @@ func Unpack(b []byte) (*Message, error) {
 			}
 			m.Fields[11] = string(p[off : off+6])
 			off += 6
+		case 48:
+			v, err := unpackLLLVAR(p, &off)
+			if err != nil {
+				return nil, fmt.Errorf("DE48: %w", err)
+			}
+			m.Fields[48] = v
 		case 70:
 			if off+3 > len(p) {
 				return nil, errors.New("truncated DE70")
 			}
 			m.Fields[70] = string(p[off : off+3])
 			off += 3
+		case 102:
+			v, err := unpackLLVAR(p, &off)
+			if err != nil {
+				return nil, fmt.Errorf("DE102: %w", err)
+			}
+			m.Fields[102] = v
 		default:
 			return nil, fmt.Errorf("field %d not implemented in skeleton", f)
 		}
