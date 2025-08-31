@@ -4,7 +4,6 @@ import (
 	"bufio"
 	"crypto/tls"
 	"encoding/binary"
-	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -69,10 +68,8 @@ func (c *Connector) loop() {
 		if c.onUp != nil {
 			c.onUp()
 		}
-		c.readLoop()
-		// readLoop exits on error or close
-		if c.onDown != nil {
-			c.onDown(errors.New("disconnected"))
+		if err := c.readLoop(); c.onDown != nil {
+			c.onDown(err)
 		}
 	}
 }
@@ -97,12 +94,12 @@ func (c *Connector) dial() error {
 	return nil
 }
 
-func (c *Connector) readLoop() {
+func (c *Connector) readLoop() error {
 	c.mu.RLock()
 	conn := c.conn
 	c.mu.RUnlock()
 	if conn == nil {
-		return
+		return nil
 	}
 
 	reader := bufio.NewReader(conn)
@@ -112,23 +109,24 @@ func (c *Connector) readLoop() {
 		mliBytes := make([]byte, 2)
 		if _, err := io.ReadFull(reader, mliBytes); err != nil {
 			c.closeConn()
-			return
+			return err
 		}
 		mli := int(binary.BigEndian.Uint16(mliBytes))
 		if mli <= 0 || mli > (64*1024) { // sanity
 			c.closeConn()
-			return
+			return fmt.Errorf("invalid MLI %d", mli)
 		}
 		payload := make([]byte, mli)
 		if _, err := io.ReadFull(reader, payload); err != nil {
 			c.closeConn()
-			return
+			return err
 		}
 		full := append(mliBytes, payload...)
 		if c.onMsg != nil {
 			c.onMsg(full)
 		}
 	}
+	return nil
 }
 
 // Send writes a full wire message (already has MLI prefix).
