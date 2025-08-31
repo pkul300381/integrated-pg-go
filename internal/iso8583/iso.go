@@ -12,8 +12,7 @@ import (
 // Message represents a minimal ISO8583 message used here.
 // MTI: 4 ASCII bytes
 // Bitmap: 8 bytes primary (and optional secondary)
-// Supported fields in this skeleton: 7 (MMDDhhmmss), 11 (STAN, 6n), 48 (LLLVAR),
-// 70 (3n) and 102 (LLVAR)
+// Field encoding is defined by the CommonSpec table.
 type Message struct {
 	MTI    string
 	Fields map[int]string // field number -> ASCII string
@@ -130,32 +129,26 @@ func (m *Message) Pack() ([]byte, error) {
 		if !ok {
 			continue
 		}
-		switch f {
-		case 7: // MMDDhhmmss (10n)
-			if len(v) != 10 {
-				return nil, fmt.Errorf("DE7 must be 10 digits, got %d", len(v))
+		spec, ok := CommonSpec[f]
+		if !ok {
+			return nil, fmt.Errorf("field %d not implemented in spec", f)
+		}
+		switch spec.Codec {
+		case FmtFixedNum, FmtFixedAns:
+			if len(v) != spec.Len {
+				return nil, fmt.Errorf("DE%d must be %d characters, got %d", f, spec.Len, len(v))
 			}
 			body.WriteString(v)
-		case 11: // STAN (6n)
-			if len(v) != 6 {
-				return nil, fmt.Errorf("DE11 must be 6 digits, got %d", len(v))
-			}
-			body.WriteString(v)
-		case 48: // Additional Data (LLLVAR)
-			if err := packLLLVAR(body, v); err != nil {
-				return nil, fmt.Errorf("DE48: %w", err)
-			}
-		case 70: // Network Mgmt Code (3n)
-			if len(v) != 3 {
-				return nil, fmt.Errorf("DE70 must be 3 digits, got %d", len(v))
-			}
-			body.WriteString(v)
-		case 102: // Account Identification 1 (LLVAR)
+		case FmtLLVAR:
 			if err := packLLVAR(body, v); err != nil {
-				return nil, fmt.Errorf("DE102: %w", err)
+				return nil, fmt.Errorf("DE%d: %w", f, err)
+			}
+		case FmtLLLVAR:
+			if err := packLLLVAR(body, v); err != nil {
+				return nil, fmt.Errorf("DE%d: %w", f, err)
 			}
 		default:
-			return nil, fmt.Errorf("field %d not implemented in skeleton", f)
+			return nil, fmt.Errorf("field %d has unknown codec", f)
 		}
 	}
 
@@ -203,39 +196,31 @@ func Unpack(b []byte) (*Message, error) {
 		if !present(f) {
 			continue
 		}
-		switch f {
-		case 7:
-			if off+10 > len(p) {
-				return nil, errors.New("truncated DE7")
+		spec, ok := CommonSpec[f]
+		if !ok {
+			return nil, fmt.Errorf("field %d not implemented in spec", f)
+		}
+		switch spec.Codec {
+		case FmtFixedNum, FmtFixedAns:
+			if off+spec.Len > len(p) {
+				return nil, fmt.Errorf("truncated DE%d", f)
 			}
-			m.Fields[7] = string(p[off : off+10])
-			off += 10
-		case 11:
-			if off+6 > len(p) {
-				return nil, errors.New("truncated DE11")
-			}
-			m.Fields[11] = string(p[off : off+6])
-			off += 6
-		case 48:
-			v, err := unpackLLLVAR(p, &off)
-			if err != nil {
-				return nil, fmt.Errorf("DE48: %w", err)
-			}
-			m.Fields[48] = v
-		case 70:
-			if off+3 > len(p) {
-				return nil, errors.New("truncated DE70")
-			}
-			m.Fields[70] = string(p[off : off+3])
-			off += 3
-		case 102:
+			m.Fields[f] = string(p[off : off+spec.Len])
+			off += spec.Len
+		case FmtLLVAR:
 			v, err := unpackLLVAR(p, &off)
 			if err != nil {
-				return nil, fmt.Errorf("DE102: %w", err)
+				return nil, fmt.Errorf("DE%d: %w", f, err)
 			}
-			m.Fields[102] = v
+			m.Fields[f] = v
+		case FmtLLLVAR:
+			v, err := unpackLLLVAR(p, &off)
+			if err != nil {
+				return nil, fmt.Errorf("DE%d: %w", f, err)
+			}
+			m.Fields[f] = v
 		default:
-			return nil, fmt.Errorf("field %d not implemented in skeleton", f)
+			return nil, fmt.Errorf("field %d has unknown codec", f)
 		}
 	}
 	if off != len(p) {
